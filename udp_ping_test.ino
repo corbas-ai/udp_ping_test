@@ -191,3 +191,182 @@ void checkWiFi(){
     delay(2000);
   }
 }
+
+byte mem_buffer[2048]={};
+#define GBS_CHUNK_SIZE 32
+
+#define GBS_SB1 0x4e
+#define GBS_SB2 0x41
+#define GBS_ACK 0xe3
+#define GBS_END 0xe4
+
+#define GBS_ERR 0x10
+#define GBS_ERR_MSG_TOO_BIG 0x11
+
+// 1 byte pix , 1 byte crc8 : 2
+#define GBS_CHUNK_SRV_LEN 2 
+
+#define is_start(_buff_, _buff_len_) (_buff_len_>= 2 && _buff_[0] == GBS_SB1 && _buff_[1] == GBS_SB2 )
+
+static enum get_buffers_state_t{
+  GBS_READY, GBS_READING
+} get_buffers_state = GBS_READY;
+
+Chrono gbs_chrono;
+
+
+//время мс передачи одного чанка
+#define GBS_WAIT1   1
+
+int get_buffers(Stream& port, byte* mem, int mem_size, int &tag) { //returns count bytes received
+  int retval = 0;
+  static short take = 0;
+  static unsigned taked = 0;
+  byte n_parts = 0;
+  if(port.available()){
+    if(get_buffers_state == GBS_READY){
+      byte buff[]={0xff,0xff,0x0,0x0,0x0};
+      int pos = 0;
+      while(port.available()){
+        buff[pos++] = port.read();
+        if(pos == sizeof(buff)){
+          if( is_start(buff, pos)){
+            gbs_chrono.restart(); 
+            take = buff[3]<<8|buff[4];
+            taked = 0;
+            tag = buff[2];
+            n_parts = gbs_send_ack( port, take, mem_size );
+            if(n_parts > 0){      
+              get_buffers_state = GBS_READING;
+            }
+          }else{
+            if(gbs_chrono.isRunning()){
+              gbs_chrono.stop();  
+            }
+          }
+          pos = 0;
+          memset(buff,0xff,sizeof(buff));  
+        }
+      }    
+    }
+    if (get_buffers_state == GBS_READING){
+      while(1){
+        if(gbs_chrono.hasPassed(GBS_WAIT1*n_parts)){
+          gbs_chrono.stop();
+          get_buffers_state = GBS_READY;
+          retval = 0;
+          break; 
+        }else{
+          static byte chunk[GBS_CHUNK_SIZE];
+          int chpos = 0;
+          int chunk_len = sizeof(GBS_CHUNK_SIZE);
+          int data_len = chunk_len-GBS_CHUNK_SRV_LEN;
+          while(port.available()){
+            chunk[chpos++] = port.read();
+            if(chpos == GBS_CHUNK_SIZE){
+              if(chkcrc8tag(tag,chunk,chpos)){
+                int pix = chunk[0];
+                if(pix < n_parts){
+                  int cpy = data_len;
+                  if((pix+1)*data_len > take){
+                      cpy = data_len - ((pix+1)*data_len-take);
+                  }
+                  memcpy(mem+pix*data_len,chunk+1, cpy );           
+                  taked += cpy;
+                }
+              }
+            }
+          }
+        }  
+        if (taked == take && taked > 0 ){
+          gbs_chrono.stop();
+          get_buffers_state = GBS_READY;
+          retval = taked;  
+          gbs_send_end_transmission(port, 1);
+          break;
+        }
+      }
+    }
+  }
+}
+
+int gbs_send_ack(Stream& port, int msg_size, int buff_size){
+  if(msg_size <= buff_size){
+    byte msg[2]={GBS_ACK, GBS_CHUNK_SIZE};
+    port.write(msg, sizeof(msg));
+    int data_len = GBS_CHUNK_SIZE - GBS_CHUNK_SRV_LEN;
+    return (msg_size+data_len-1)/data_len;
+  }else{
+      byte msg[2]={GBS_ERR, GBS_ERR_MSG_TOO_BIG};
+      port.write(msg, sizeof(msg));
+      return 0;
+  }
+}
+
+void gbs_send_end_transmission(Stream& port, int is_ok ){
+  if(is_ok){
+    byte msg[2]={GBS_END, GBS_END};
+    port.write(msg, sizeof(msg));
+  }else{
+    byte msg[2]={GBS_END, GBS_ERR};
+    port.write(msg, sizeof(msg));
+  }  
+}
+
+uint8_t gencrc8(uint8_t *buff, int len){
+    uint8_t crc = 0x00;
+    for (int i = 0; i < len; i++) {
+        crc ^= *buff++;
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x80){
+                crc = (uint8_t)((crc << 1) ^ 0x07);
+            }else{
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+bool chkcrc8(uint8_t* b, int b_len){
+  if(b_len <= 0){
+    return false;  
+  }
+  return b[b_len-1] == gencrc8(b, b_len-1); 
+}
+
+uint8_t gencrc8tag(uint8_t tag, uint8_t *buff, int len){
+    uint8_t crc = 0x00;
+    crc ^= tag;
+    for (int j = 0; j < 8; j++) {
+        if (crc & 0x80){
+            crc = (uint8_t)((crc << 1) ^ 0x07);
+        }else{
+            crc <<= 1;
+        }
+    }
+    for (int i = 0; i < len; i++) {
+        crc ^= *buff++;
+        for (int j = 0; j < 8; j++) {
+            if (crc & 0x80){
+                crc = (uint8_t)((crc << 1) ^ 0x07);
+            }else{
+                crc <<= 1;
+            }
+        }
+    }
+    return crc;
+}
+
+bool chkcrc8tag(uint8_t tag, uint8_t* b, int b_len){
+  if(b_len <= 0){
+    return false;  
+  }
+  return b[b_len-1] == gencrc8tag(tag, b, b_len-1); 
+}
+
+void pcrc8tag( uint8_t tag, uint8_t* b, int b_len){
+  if( b_len > 0){
+    b[b_len-1] = gencrc8tag( tag, b, b_len-1);
+  }
+}
